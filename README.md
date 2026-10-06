@@ -99,9 +99,12 @@ chmod 600 ~/.secrets/certbot/muumuu.ini
 Certbot stores the path to this file (not its contents) in the renewal configuration, so keep it
 in place for renewals.
 
-The file is checked before any API call: the token must start with `muu_pat_`, a custom
-endpoint must be an `https://` URL, and a sandbox token (`muu_pat_sandbox_...`) is rejected
-unless `dns_muumuu_endpoint` points at the sandbox, because the production API refuses it.
+The file is checked before any API call:
+
+- the token must start with `muu_pat_`;
+- a custom endpoint must be an `https://` URL without a query string or fragment;
+- a sandbox token (`muu_pat_sandbox_...`) is rejected for the production endpoint, whether it is
+  the default or set explicitly, because the production API refuses it.
 
 ## Usage
 
@@ -124,28 +127,34 @@ first exact match. Bare TLDs such as `jp` are not queried.
 
 ## How it works
 
-1. Find the domain ID (`MU` + 8 digits) with `GET /me/domains?fqdn=<candidate>`.
+1. Find the domain ID (`MU` + 8 digits) with `GET /me/domains?fqdn=<candidate>`. This happens
+   once per registered domain, so `-d a.example.com -d b.example.com -d '*.example.com'` needs a
+   single lookup.
 2. Check `GET /me/domains/{id}/nameservers` and log a warning when `setup-type` is not
-   `muumuu_dns`.
+   `muumuu_dns`. If this check itself fails, it is skipped rather than aborting issuance.
 3. Create the record with `POST /me/domains/{id}/dns-records`
    (`{"fqdn": "_acme-challenge.example.com", "type": "TXT", "value": "<token>"}`).
    If an identical record already exists (HTTP 409, e.g. after an interrupted run), it is reused.
 4. Wait `--dns-muumuu-propagation-seconds`, then let the ACME server validate.
 5. Delete exactly the record created in step 3 with `DELETE /me/domains/{id}/dns-records/{record-id}`.
    If its ID is unknown, the TXT records of that name are listed and only the one whose value
-   equals the validation token is deleted. Other records are never touched, and cleanup failures
-   are logged instead of aborting Certbot.
+   equals the validation token is deleted. Other records are never touched. Cleanup failures are
+   logged instead of aborting Certbot, and a failed deletion does not stop the remaining ones.
 
 Every request is attempted up to 3 times:
 
-- HTTP 429 waits for `Retry-After` (seconds or an HTTP date). If it asks for more than 300 seconds,
-  the plugin gives up immediately instead.
-- HTTP 500/502/503/504, connection errors and timeouts are retried after 1 and then 2 seconds.
+- HTTP 429 and 503 wait for `Retry-After` (seconds or an HTTP date); 429 without the header
+  waits 60 seconds. If the server asks for more than 300 seconds, the plugin gives up
+  immediately instead.
+- HTTP 500/502/503/504 without `Retry-After`, connection errors and timeouts are retried after
+  1 and then 2 seconds.
   Retrying a `POST` is safe: if the first attempt did create the record, the retry gets
   HTTP 409 and the existing record is used.
 
 Other errors are reported as Certbot errors naming the request that failed. HTTP 401/403 errors
-come with a hint about the token and its scopes.
+come with a hint about the token and its scopes. Responses that do not match the documented
+shape (wrong types, missing fields, non-JSON bodies) are reported the same way rather than as
+Python tracebacks.
 
 ## Behaviour verified against the production API
 
