@@ -1,6 +1,6 @@
 [project]
 name = "certbot-dns-muumuu"
-version = "0.0.0"
+version = "0.0.1"
 description = "Muumuu Domain DNS Authenticator plugin for Certbot"
 readme = "README.md"
 license = "Apache-2.0"
