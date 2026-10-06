@@ -3,8 +3,11 @@
 import logging
 import time
 from collections.abc import Callable
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any
+from urllib.parse import urlsplit
 
 import requests
 from certbot import errors
@@ -14,6 +17,9 @@ from certbot.plugins.dns_common import CredentialsConfiguration
 logger = logging.getLogger(__name__)
 
 DEFAULT_ENDPOINT = "https://muumuu-domain.com/api/v2"
+SANDBOX_ENDPOINT = "https://api-sandbox.muumuu-domain.com/api/v2"
+TOKEN_PREFIX = "muu_pat_"
+SANDBOX_TOKEN_PREFIX = "muu_pat_sandbox_"
 REQUIRED_SCOPES = ("domains:read", "dns:read", "dns:write")
 MUUMUU_DNS_SETUP_TYPE = "muumuu_dns"
 
@@ -63,7 +69,33 @@ class Authenticator(dns_common.DNSAuthenticator):
                 "token": "Personal Access Token for the Muumuu Domain API "
                 f"(scopes: {', '.join(REQUIRED_SCOPES)})",
             },
+            self._validate_credentials,
         )
+
+    @staticmethod
+    def _validate_credentials(credentials: CredentialsConfiguration) -> None:
+        filename = credentials.confobj.filename
+        token = credentials.conf("token") or ""
+        if not token.startswith(TOKEN_PREFIX):
+            raise errors.PluginError(
+                f"{filename}: dns_muumuu_token does not look like a Muumuu Domain Personal "
+                f"Access Token (it should start with {TOKEN_PREFIX})."
+            )
+
+        endpoint = credentials.conf("endpoint")
+        if endpoint:
+            url = urlsplit(endpoint)
+            if url.scheme != "https" or not url.netloc:
+                raise errors.PluginError(
+                    f"{filename}: dns_muumuu_endpoint must be an https:// URL "
+                    f"(e.g. {SANDBOX_ENDPOINT}), got {endpoint!r}."
+                )
+        elif token.startswith(SANDBOX_TOKEN_PREFIX):
+            raise errors.PluginError(
+                f"{filename}: dns_muumuu_token is a sandbox token, which the production API "
+                f"rejects. Set dns_muumuu_endpoint = {SANDBOX_ENDPOINT} to use the sandbox, "
+                "or use a production token."
+            )
 
     def _perform(self, domain: str, validation_name: str, validation: str) -> None:
         client = self._get_client()
@@ -73,17 +105,23 @@ class Authenticator(dns_common.DNSAuthenticator):
         )
 
     def _cleanup(self, domain: str, validation_name: str, validation: str) -> None:
+        domain_id = self._domain_ids.get(domain)
+        if domain_id is None:
+            logger.debug("No TXT record was created for %s; nothing to clean up.", domain)
+            return
+
         try:
             client = self._get_client()
-            domain_id = self._find_domain_id(client, domain)
             record_id = self._record_ids.pop((validation_name, validation), None)
             if record_id is None:
                 record_ids = client.find_txt_record_ids(domain_id, validation_name, validation)
             else:
                 record_ids = [record_id]
+            if not record_ids:
+                logger.debug("TXT record for %s not found; no cleanup needed.", validation_name)
             for rid in record_ids:
                 client.delete_record(domain_id, rid)
-        except (errors.PluginError, requests.RequestException) as e:
+        except errors.PluginError as e:
             logger.warning(
                 "Encountered error deleting TXT record %s for %s: %s", validation_name, domain, e
             )
@@ -128,6 +166,7 @@ class _MuumuuClient:
     max_attempts = 3
     max_retry_after = 300
     timeout = 30
+    retryable_statuses = frozenset({429, 500, 502, 503, 504})
 
     def __init__(
         self,
@@ -154,9 +193,16 @@ class _MuumuuClient:
         :returns: The domain ID (e.g. ``MU00000001``) and the FQDN of the registered domain.
         :raises certbot.errors.PluginError: if no registered domain matches.
         """
-        guesses = dns_common.base_domain_name_guesses(domain)
+        # Why not query bare TLDs such as "com": the API rejects them with 400.
+        guesses = [g for g in dns_common.base_domain_name_guesses(domain) if "." in g]
         for guess in guesses:
-            body = self._request("GET", "/me/domains", params={"fqdn": guess})
+            try:
+                body = self._request("GET", "/me/domains", params={"fqdn": guess})
+            except _ApiError as e:
+                if e.status_code != 400:
+                    raise
+                logger.debug("Skipping %s, which the API does not accept: %s", guess, e)
+                continue
             for item in body.get("data", []):
                 if _normalize(item.get("fqdn", "")) == _normalize(guess):
                     logger.debug("Found domain %s (%s) for %s", item["fqdn"], item["id"], domain)
@@ -175,8 +221,8 @@ class _MuumuuClient:
     def add_txt_record(self, domain_id: str, record_name: str, record_content: str) -> int:
         """Create a TXT record and return its ID.
 
-        If an identical record already exists (e.g. left over from an interrupted run), its ID
-        is returned instead.
+        If an identical record already exists (e.g. left over from an interrupted run, or created
+        by a retried request whose response was lost), its ID is returned instead.
 
         :raises certbot.errors.PluginError: if the record cannot be created.
         """
@@ -242,58 +288,101 @@ class _MuumuuClient:
             page += 1
 
     def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        # Why not retry only idempotent methods: a retried POST whose first attempt did create
+        # the record gets 409, which add_txt_record resolves to the existing record.
         url = self.endpoint + path
         for attempt in range(1, self.max_attempts + 1):
-            response = self.session.request(method, url, timeout=self.timeout, **kwargs)
-            if response.status_code != 429 or attempt == self.max_attempts:
-                break
-            wait = _retry_after(response)
-            if wait > self.max_retry_after:
-                break
-            logger.info("Rate limited by the Muumuu Domain API; retrying in %d seconds", wait)
+            try:
+                response = self.session.request(method, url, timeout=self.timeout, **kwargs)
+            except (requests.ConnectionError, requests.Timeout) as e:
+                if attempt == self.max_attempts:
+                    raise errors.PluginError(
+                        f"Network error communicating with the Muumuu Domain API "
+                        f"({method} {path}): {e}"
+                    ) from e
+                wait = self._backoff(attempt)
+                logger.info("Network error (%s); retrying in %d seconds", e, wait)
+            except requests.RequestException as e:
+                raise errors.PluginError(
+                    f"Error communicating with the Muumuu Domain API ({method} {path}): {e}"
+                ) from e
+            else:
+                if (
+                    response.status_code not in self.retryable_statuses
+                    or attempt == self.max_attempts
+                ):
+                    break
+                if response.status_code == 429:
+                    wait = _retry_after(response)
+                else:
+                    wait = self._backoff(attempt)
+                if wait > self.max_retry_after:
+                    break
+                logger.info(
+                    "Muumuu Domain API returned HTTP %d; retrying in %d seconds",
+                    response.status_code,
+                    wait,
+                )
             self._sleep(wait)
 
         if response.status_code >= 400:
-            raise _ApiError.from_response(response)
+            raise _ApiError.from_response(response, f"{method} {path}")
         if response.status_code == 204 or not response.content:
             return {}
-        result: dict[str, Any] = response.json()
+        try:
+            result = response.json()
+        except ValueError as e:
+            raise errors.PluginError(
+                f"Unexpected non-JSON response from the Muumuu Domain API ({method} {path}, "
+                f"HTTP {response.status_code})"
+            ) from e
+        if not isinstance(result, dict):
+            raise errors.PluginError(
+                f"Unexpected response from the Muumuu Domain API ({method} {path}): {result!r}"
+            )
         return result
+
+    @staticmethod
+    def _backoff(attempt: int) -> int:
+        return int(2 ** (attempt - 1))
 
 
 class _ApiError(errors.PluginError):
-    def __init__(self, status_code: int, code: str, message: str) -> None:
+    def __init__(self, status_code: int, code: str, message: str, request: str = "") -> None:
         self.status_code = status_code
         self.code = code
-        super().__init__(self._describe(status_code, code, message))
+        super().__init__(self._describe(status_code, code, message, request))
 
     @classmethod
-    def from_response(cls, response: requests.Response) -> "_ApiError":
+    def from_response(cls, response: requests.Response, request: str = "") -> "_ApiError":
         try:
             error = response.json().get("error", {})
-        except ValueError:
+        except (ValueError, AttributeError):
             error = {}
         return cls(
             response.status_code,
             error.get("code", ""),
             error.get("message", "") or response.reason or "",
+            request,
         )
 
     @staticmethod
-    def _describe(status_code: int, code: str, message: str) -> str:
+    def _describe(status_code: int, code: str, message: str, request: str) -> str:
         detail = f"HTTP {status_code}" + (f" {code}" if code else "") + f": {message}"
+        if request:
+            detail += f" ({request})"
         if status_code == 401:
             return (
-                f"{detail} (the Personal Access Token is invalid or expired; "
-                "check dns_muumuu_token in the credentials file)"
+                f"{detail}. Check dns_muumuu_token in the credentials file; the token may "
+                "have been revoked or have expired."
             )
         if status_code == 403:
             return (
-                f"{detail} (make sure the Personal Access Token has the "
-                f"{', '.join(REQUIRED_SCOPES)} scopes)"
+                f"{detail}. Make sure the Personal Access Token has the "
+                f"{', '.join(REQUIRED_SCOPES)} scopes."
             )
         if status_code == 429:
-            return f"{detail} (rate limit exceeded; try again later)"
+            return f"{detail}. The API rate limit was exceeded; try again later."
         return detail
 
 
@@ -310,7 +399,17 @@ def _unquote(value: str) -> str:
 
 
 def _retry_after(response: requests.Response) -> int:
-    try:
-        return max(int(response.headers.get("Retry-After", "60")), 1)
-    except ValueError:
+    header = response.headers.get("Retry-After")
+    if header is None:
         return 60
+    try:
+        return max(int(header), 1)
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(header)
+    except (TypeError, ValueError):
+        return 60
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(int((when - datetime.now(timezone.utc)).total_seconds()), 1)

@@ -3,6 +3,8 @@
 import logging
 import sys
 import unittest
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from typing import Any
 from unittest import mock
 
@@ -24,6 +26,7 @@ from certbot_dns_muumuu._internal.dns_muumuu import (
 
 TOKEN = "muu_pat_0123456789abcdef"
 SANDBOX = "https://api-sandbox.muumuu-domain.com/api/v2"
+SANDBOX_TOKEN = "muu_pat_sandbox_0123456789abcdef"
 
 
 class AuthenticatorTest(test_util.TempDirTestCase, dns_test_common.BaseAuthenticatorTest):
@@ -91,6 +94,7 @@ class AuthenticatorTest(test_util.TempDirTestCase, dns_test_common.BaseAuthentic
     def test_cleanup_without_known_record_matches_by_value(self) -> None:
         self.auth._setup_credentials()
         self.auth._attempt_cleanup = True
+        self.auth._domain_ids[DOMAIN] = "MU00000001"
         self.mock_client.find_txt_record_ids.return_value = [7]
 
         self.auth.cleanup([self.achall])
@@ -99,6 +103,45 @@ class AuthenticatorTest(test_util.TempDirTestCase, dns_test_common.BaseAuthentic
             "MU00000001", "_acme-challenge." + DOMAIN, mock.ANY
         )
         self.mock_client.delete_record.assert_called_once_with("MU00000001", 7)
+
+    def test_cleanup_without_matching_record(self) -> None:
+        self.auth._setup_credentials()
+        self.auth._attempt_cleanup = True
+        self.auth._domain_ids[DOMAIN] = "MU00000001"
+        self.mock_client.find_txt_record_ids.return_value = []
+
+        self.auth.cleanup([self.achall])
+
+        self.mock_client.delete_record.assert_not_called()
+
+    @test_util.patch_display_util()
+    def test_cleanup_after_failed_domain_lookup_does_nothing(
+        self, unused_mock_get_utility: Any
+    ) -> None:
+        self.mock_client.find_domain.side_effect = errors.PluginError("not found")
+        with pytest.raises(errors.PluginError):
+            self.auth.perform([self.achall])
+
+        with self.assertNoLogs("certbot_dns_muumuu", logging.WARNING):
+            self.auth.cleanup([self.achall])
+
+        self.mock_client.find_domain.assert_called_once()
+        self.mock_client.get_nameserver_settings.assert_not_called()
+        self.mock_client.find_txt_record_ids.assert_not_called()
+        self.mock_client.delete_record.assert_not_called()
+
+    @test_util.patch_display_util()
+    def test_cleanup_after_failed_creation_matches_by_value(
+        self, unused_mock_get_utility: Any
+    ) -> None:
+        self.mock_client.add_txt_record.side_effect = errors.PluginError("network error")
+        self.mock_client.find_txt_record_ids.return_value = [9]
+        with pytest.raises(errors.PluginError):
+            self.auth.perform([self.achall])
+
+        self.auth.cleanup([self.achall])
+
+        self.mock_client.delete_record.assert_called_once_with("MU00000001", 9)
 
     @test_util.patch_display_util()
     def test_cleanup_logs_errors(self, unused_mock_get_utility: Any) -> None:
@@ -110,16 +153,6 @@ class AuthenticatorTest(test_util.TempDirTestCase, dns_test_common.BaseAuthentic
 
         assert "boom" in logs.output[0]
 
-    def test_cleanup_logs_network_errors(self) -> None:
-        self.auth._setup_credentials()
-        self.auth._attempt_cleanup = True
-        self.mock_client.find_domain.side_effect = requests.ConnectionError("offline")
-
-        with self.assertLogs("certbot_dns_muumuu", logging.WARNING) as logs:
-            self.auth.cleanup([self.achall])
-
-        assert "offline" in logs.output[0]
-
     def test_missing_token(self) -> None:
         dns_test_common.write({}, self.config.muumuu_credentials)
 
@@ -127,7 +160,7 @@ class AuthenticatorTest(test_util.TempDirTestCase, dns_test_common.BaseAuthentic
             self.auth._setup_credentials()
 
 
-class GetClientTest(test_util.TempDirTestCase):
+class CredentialsTest(test_util.TempDirTestCase):
     def _auth(self, values: dict[str, str]) -> Authenticator:
         path = os.path.join(self.tempdir, "file.ini")
         dns_test_common.write(values, path)
@@ -146,6 +179,29 @@ class GetClientTest(test_util.TempDirTestCase):
         auth = self._auth({"muumuu_token": TOKEN, "muumuu_endpoint": SANDBOX + "/"})
 
         assert auth._get_client().endpoint == SANDBOX
+
+    def test_sandbox_token_with_sandbox_endpoint(self) -> None:
+        auth = self._auth({"muumuu_token": SANDBOX_TOKEN, "muumuu_endpoint": SANDBOX})
+
+        assert auth._get_client().endpoint == SANDBOX
+
+    def test_rejects_token_without_prefix(self) -> None:
+        with pytest.raises(errors.PluginError, match="should start with muu_pat_"):
+            self._auth({"muumuu_token": "0123456789abcdef"})
+
+    def test_rejects_sandbox_token_for_production(self) -> None:
+        with pytest.raises(errors.PluginError, match="sandbox token"):
+            self._auth({"muumuu_token": SANDBOX_TOKEN})
+
+    def test_rejects_plain_http_endpoint(self) -> None:
+        with pytest.raises(errors.PluginError, match="must be an https:// URL"):
+            self._auth(
+                {"muumuu_token": TOKEN, "muumuu_endpoint": "http://muumuu-domain.com/api/v2"}
+            )
+
+    def test_rejects_endpoint_without_host(self) -> None:
+        with pytest.raises(errors.PluginError, match="must be an https:// URL"):
+            self._auth({"muumuu_token": TOKEN, "muumuu_endpoint": "muumuu-domain.com/api/v2"})
 
 
 def _records_page(records: list[dict[str, Any]], total: int, page: int = 1) -> dict[str, Any]:
@@ -186,6 +242,7 @@ class MuumuuClientTest(unittest.TestCase):
 
         assert self.client.find_domain("www.sub.example.com") == ("MU00000001", "example.com")
         assert self.rsps.calls[0].request.headers["Authorization"] == f"Bearer {TOKEN}"
+        assert self.rsps.calls[0].request.headers["User-Agent"].startswith("certbot-dns-muumuu")
 
     def test_find_domain_for_multi_label_tld(self) -> None:
         self._domains("www.example.co.jp", [])
@@ -195,17 +252,29 @@ class MuumuuClientTest(unittest.TestCase):
 
     def test_find_domain_ignores_inexact_matches(self) -> None:
         self._domains("example.com", [{"id": "MU00000001", "fqdn": "other.com"}])
-        self._domains("com", [])
 
         with pytest.raises(errors.PluginError, match="Unable to find"):
             self.client.find_domain("example.com")
 
-    def test_find_domain_not_found(self) -> None:
+    def test_find_domain_not_found_does_not_query_bare_tld(self) -> None:
+        self._domains("www.example.com", [])
         self._domains("example.com", [])
-        self._domains("com", [])
 
-        with pytest.raises(errors.PluginError, match="tried: example.com, com"):
-            self.client.find_domain("example.com")
+        with pytest.raises(errors.PluginError, match=r"tried: www.example.com, example.com\)"):
+            self.client.find_domain("www.example.com")
+        assert len(self.rsps.calls) == 2
+
+    def test_find_domain_skips_guesses_rejected_by_the_api(self) -> None:
+        self._domains("example.co.jp", [])
+        self.rsps.get(
+            self._url("/me/domains"),
+            match=[matchers.query_param_matcher({"fqdn": "co.jp"})],
+            status=400,
+            json={"error": {"code": "bad_request", "message": "Invalid fqdn parameter format"}},
+        )
+
+        with pytest.raises(errors.PluginError, match="Unable to find a Muumuu Domain domain"):
+            self.client.find_domain("example.co.jp")
 
     def test_unauthorized(self) -> None:
         self.rsps.get(
@@ -228,9 +297,21 @@ class MuumuuClientTest(unittest.TestCase):
             self.client.find_domain("example.com")
 
     def test_non_json_error(self) -> None:
-        self.rsps.get(self._url("/me/domains"), status=502, body="<html>Bad Gateway</html>")
+        self.rsps.get(self._url("/me/domains"), status=404, body="<html>Not Found</html>")
 
-        with pytest.raises(errors.PluginError, match="HTTP 502"):
+        with pytest.raises(errors.PluginError, match=r"HTTP 404: Not Found \(GET /me/domains\)"):
+            self.client.find_domain("example.com")
+
+    def test_non_json_success(self) -> None:
+        self.rsps.get(self._url("/me/domains"), status=200, body="<html>Maintenance</html>")
+
+        with pytest.raises(errors.PluginError, match="non-JSON response"):
+            self.client.find_domain("example.com")
+
+    def test_unexpected_json_success(self) -> None:
+        self.rsps.get(self._url("/me/domains"), status=200, json=["unexpected"])
+
+        with pytest.raises(errors.PluginError, match="Unexpected response"):
             self.client.find_domain("example.com")
 
     def test_get_nameserver_settings(self) -> None:
@@ -367,6 +448,28 @@ class MuumuuClientTest(unittest.TestCase):
         assert self.client.get_nameserver_settings(self.domain_id) == {"setup-type": "muumuu_dns"}
         assert self.sleep.call_args_list == [mock.call(7), mock.call(60)]
 
+    def test_retry_after_http_date(self) -> None:
+        url = self._url(f"/me/domains/{self.domain_id}/nameservers")
+        when = datetime.now(timezone.utc) + timedelta(seconds=120)
+        self.rsps.get(url, status=429, headers={"Retry-After": format_datetime(when, usegmt=True)})
+        self.rsps.get(url, status=429, json={})
+        self.rsps.get(url, json={"data": {}})
+
+        self.client.get_nameserver_settings(self.domain_id)
+
+        first, second = (c.args[0] for c in self.sleep.call_args_list)
+        assert 100 <= first <= 120
+        assert second == 60
+
+    def test_retry_after_http_date_in_the_past(self) -> None:
+        url = self._url(f"/me/domains/{self.domain_id}/nameservers")
+        self.rsps.get(url, status=429, headers={"Retry-After": "Wed, 21 Oct 2015 07:28:00 -0000"})
+        self.rsps.get(url, json={"data": {}})
+
+        self.client.get_nameserver_settings(self.domain_id)
+
+        assert self.sleep.call_args_list == [mock.call(1)]
+
     def test_gives_up_after_max_attempts(self) -> None:
         url = self._url(f"/me/domains/{self.domain_id}/nameservers")
         for _ in range(3):
@@ -392,6 +495,69 @@ class MuumuuClientTest(unittest.TestCase):
         with pytest.raises(errors.PluginError, match="HTTP 429"):
             self.client.get_nameserver_settings(self.domain_id)
         self.sleep.assert_not_called()
+
+    def test_retries_server_errors_with_backoff(self) -> None:
+        url = self._url(f"/me/domains/{self.domain_id}/nameservers")
+        self.rsps.get(url, status=503, json={"error": {"code": "service_unavailable"}})
+        self.rsps.get(url, status=502, body="Bad Gateway")
+        self.rsps.get(url, json={"data": {"setup-type": "muumuu_dns"}})
+
+        assert self.client.get_nameserver_settings(self.domain_id) == {"setup-type": "muumuu_dns"}
+        assert self.sleep.call_args_list == [mock.call(1), mock.call(2)]
+
+    def test_does_not_retry_client_errors(self) -> None:
+        self.rsps.get(
+            self._url(f"/me/domains/{self.domain_id}/nameservers"),
+            status=404,
+            json={"error": {"code": "not_found", "message": "Not found"}},
+        )
+
+        with pytest.raises(errors.PluginError, match="HTTP 404 not_found"):
+            self.client.get_nameserver_settings(self.domain_id)
+        self.sleep.assert_not_called()
+
+    def test_retries_network_errors(self) -> None:
+        url = self._url(f"/me/domains/{self.domain_id}/nameservers")
+        self.rsps.get(url, body=requests.ConnectionError("connection reset"))
+        self.rsps.get(url, body=requests.Timeout("read timed out"))
+        self.rsps.get(url, json={"data": {"setup-type": "muumuu_dns"}})
+
+        assert self.client.get_nameserver_settings(self.domain_id) == {"setup-type": "muumuu_dns"}
+        assert self.sleep.call_count == 2
+
+    def test_persistent_network_error(self) -> None:
+        url = self._url(f"/me/domains/{self.domain_id}/nameservers")
+        for _ in range(3):
+            self.rsps.get(url, body=requests.ConnectionError("connection refused"))
+
+        with pytest.raises(errors.PluginError, match="Network error.*connection refused"):
+            self.client.get_nameserver_settings(self.domain_id)
+
+    def test_other_request_errors_are_not_retried(self) -> None:
+        self.rsps.get(
+            self._url(f"/me/domains/{self.domain_id}/nameservers"),
+            body=requests.TooManyRedirects("too many redirects"),
+        )
+
+        with pytest.raises(errors.PluginError, match="too many redirects"):
+            self.client.get_nameserver_settings(self.domain_id)
+        self.sleep.assert_not_called()
+
+    def test_retried_post_that_succeeded_reuses_the_record(self) -> None:
+        url = self._url(f"/me/domains/{self.domain_id}/dns-records")
+        self.rsps.post(url, body=requests.ReadTimeout("read timed out"))
+        self.rsps.post(
+            url,
+            status=409,
+            json={"error": {"code": "conflict", "message": "already exists"}},
+        )
+        self.rsps.get(
+            url, json=_records_page([_txt(5, self.record_name + ".", self.record_content)], 1)
+        )
+
+        assert (
+            self.client.add_txt_record(self.domain_id, self.record_name, self.record_content) == 5
+        )
 
 
 if __name__ == "__main__":
