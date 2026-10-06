@@ -18,15 +18,44 @@ that are not reachable from the Internet.
 
 ## Installation
 
-Install the plugin into the same Python environment as Certbot:
+The plugin is not on PyPI yet; install it from GitHub.
+
+### pip
+
+Install the plugin into the same Python environment as Certbot (e.g. the virtualenv set up by
+[Certbot's pip instructions](https://certbot.eff.org/instructions?ws=other&os=pip)):
 
 ```sh
-pip install git+https://github.com/kenchan/certbot-dns-muumuu.git
+pip install https://github.com/kenchan/certbot-dns-muumuu/archive/refs/heads/main.tar.gz
 ```
 
-If Certbot is installed with snap or Docker, the plugin has to be installed into that
-environment instead (e.g. build a Docker image `FROM certbot/certbot` that runs the command
-above).
+### Docker
+
+Extend the official image:
+
+```dockerfile
+FROM certbot/certbot
+RUN pip install --no-cache-dir https://github.com/kenchan/certbot-dns-muumuu/archive/refs/heads/main.tar.gz
+```
+
+```sh
+docker build -t certbot-dns-muumuu .
+docker run --rm -it \
+  -v /etc/letsencrypt:/etc/letsencrypt \
+  -v /var/lib/letsencrypt:/var/lib/letsencrypt \
+  -v ~/.secrets/certbot:/secrets:ro \
+  certbot-dns-muumuu certonly \
+  --authenticator dns-muumuu \
+  --dns-muumuu-credentials /secrets/muumuu.ini \
+  -d example.com -d '*.example.com'
+```
+
+### snap
+
+Not supported. The Certbot snap only loads third-party plugins that are packaged as snaps
+themselves, and this plugin is not. Use pip or Docker instead.
+
+### Verify
 
 Check that Certbot sees the plugin:
 
@@ -70,6 +99,10 @@ chmod 600 ~/.secrets/certbot/muumuu.ini
 Certbot stores the path to this file (not its contents) in the renewal configuration, so keep it
 in place for renewals.
 
+The file is checked before any API call: the token must start with `muu_pat_`, a custom
+endpoint must be an `https://` URL, and a sandbox token (`muu_pat_sandbox_...`) is rejected
+unless `dns_muumuu_endpoint` points at the sandbox, because the production API refuses it.
+
 ## Usage
 
 ```sh
@@ -86,8 +119,8 @@ certbot certonly \
 | `--dns-muumuu-propagation-seconds`   | Seconds to wait before asking the ACME server to validate (default: `30`)   |
 
 Sub-domains and multi-label TLDs work as expected: for `-d www.example.co.jp` the plugin tries
-`www.example.co.jp`, `example.co.jp`, `co.jp`, ... against the domains in your account and uses
-the first exact match.
+`www.example.co.jp`, `example.co.jp` and `co.jp` against the domains in your account and uses the
+first exact match. Bare TLDs such as `jp` are not queried.
 
 ## How it works
 
@@ -103,8 +136,16 @@ the first exact match.
    equals the validation token is deleted. Other records are never touched, and cleanup failures
    are logged instead of aborting Certbot.
 
-HTTP 429 responses are retried up to 3 times, honouring `Retry-After` (up to 300 seconds).
-HTTP 401/403 errors are reported with a hint about the token and its scopes.
+Every request is attempted up to 3 times:
+
+- HTTP 429 waits for `Retry-After` (seconds or an HTTP date). If it asks for more than 300 seconds,
+  the plugin gives up immediately instead.
+- HTTP 500/502/503/504, connection errors and timeouts are retried after 1 and then 2 seconds.
+  Retrying a `POST` is safe: if the first attempt did create the record, the retry gets
+  HTTP 409 and the existing record is used.
+
+Other errors are reported as Certbot errors naming the request that failed. HTTP 401/403 errors
+come with a hint about the token and its scopes.
 
 ## Behaviour verified against the production API
 
@@ -120,6 +161,8 @@ on a real domain with the production API and querying `dns01.muumuu-domain.com` 
 - **TXT values are returned unquoted** (e.g. `did=did:plc:...`) and `fqdn` is returned with a
   trailing dot. The `fqdn` filter on `GET .../dns-records` accepts it with or without the dot.
 - **Deleting a missing record returns HTTP 404**, which the plugin treats as already deleted.
+- **Bare TLDs are rejected:** `GET /me/domains?fqdn=com` returns HTTP 400, while `fqdn=co.jp`
+  returns an empty list.
 - **Propagation:** new records were answered authoritatively by both Muumuu DNS servers within
   about 2 seconds. The default of 30 seconds leaves a wide margin for slower updates; raise
   `--dns-muumuu-propagation-seconds` if validation fails with "no TXT record found".
@@ -127,6 +170,8 @@ on a real domain with the production API and querying `dns01.muumuu-domain.com` 
   delegated to Muumuu DNS) was issued from the Let's Encrypt staging environment with the default
   settings, and `certbot renew --dry-run` succeeded. Both challenge records were removed
   afterwards.
+- **TTL 3600 did not get in the way:** the dry run, about one minute after the first issuance,
+  validated new challenge values for the same `_acme-challenge` name.
 
 ## Limitations
 
@@ -134,7 +179,9 @@ on a real domain with the production API and querying `dns01.muumuu-domain.com` 
   nameserver setting, but they are only visible on the public DNS when the domain is delegated to
   Muumuu DNS. Other settings (`custom`, `acquired_domain`, `lolipop`, `parking`, ...) only cause a
   warning, because some of them may still point at Muumuu DNS; validation will fail if they don't.
-- **TTL is fixed at 3600 seconds** by the API and cannot be changed.
+- **TTL is fixed at 3600 seconds** by the API and cannot be changed (other providers' plugins
+  use 10 to 120 seconds). A resolver that cached an earlier challenge could in theory serve
+  stale values for up to an hour. Let's Encrypt was not affected in testing (see above).
 - **At most 200 records per domain** (excluding SOA). Creating a record beyond that fails with
   "Record limit exceeded".
 - **Rate limit:** 1,000 authenticated requests per hour.
@@ -148,6 +195,11 @@ uv run ruff check .
 uv run ruff format --check .
 uv run mypy
 uv build
+
+# Minimum supported versions
+uv run --isolated --python 3.10 --with-editable . \
+  --with certbot==4.0.0 --with acme==4.0.0 --with requests==2.32.4 \
+  --with pytest --with responses pytest
 ```
 
 ## License

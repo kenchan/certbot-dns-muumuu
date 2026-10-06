@@ -33,3 +33,14 @@ jobs:
       - run: uv sync --locked
       - run: uv run pytest
       - run: uv build
+
+  test-minimum:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+      - run: >-
+          uv run --isolated --python 3.10 --with-editable .
+          --with certbot==4.0.0 --with acme==4.0.0 --with requests==2.32.4
+          --with pytest --with responses
+          pytest
