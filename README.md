@@ -123,6 +123,10 @@ on a real domain with the production API and querying `dns01.muumuu-domain.com` 
 - **Propagation:** new records were answered authoritatively by both Muumuu DNS servers within
   about 2 seconds. The default of 30 seconds leaves a wide margin for slower updates; raise
   `--dns-muumuu-propagation-seconds` if validation fails with "no TXT record found".
+- **End-to-end issuance:** a certificate for `example.com` + `*.example.com` (a `.com` domain
+  delegated to Muumuu DNS) was issued from the Let's Encrypt staging environment with the default
+  settings, and `certbot renew --dry-run` succeeded. Both challenge records were removed
+  afterwards.
 
 ## Limitations
 
@@ -134,8 +138,6 @@ on a real domain with the production API and querying `dns01.muumuu-domain.com` 
 - **At most 200 records per domain** (excluding SOA). Creating a record beyond that fails with
   "Record limit exceeded".
 - **Rate limit:** 1,000 authenticated requests per hour.
-- A real certificate issuance (`certbot certonly`) against a domain delegated to Muumuu DNS has
-  not been tested yet.
 
 ## Development
 
