@@ -18,7 +18,7 @@ that are not reachable from the Internet.
 
 ## Installation
 
-The plugin is not on PyPI yet; install it from GitHub.
+The plugin is published on [PyPI](https://pypi.org/project/certbot-dns-muumuu/).
 
 ### pip
 
@@ -26,7 +26,7 @@ Install the plugin into the same Python environment as Certbot (e.g. the virtual
 [Certbot's pip instructions](https://certbot.eff.org/instructions?ws=other&os=pip)):
 
 ```sh
-pip install https://github.com/kenchan/certbot-dns-muumuu/archive/refs/heads/main.tar.gz
+pip install certbot-dns-muumuu
 ```
 
 ### Docker
@@ -35,7 +35,7 @@ Extend the official image:
 
 ```dockerfile
 FROM certbot/certbot
-RUN pip install --no-cache-dir https://github.com/kenchan/certbot-dns-muumuu/archive/refs/heads/main.tar.gz
+RUN pip install --no-cache-dir certbot-dns-muumuu
 ```
 
 ```sh
