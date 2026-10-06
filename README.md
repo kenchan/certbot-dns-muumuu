@@ -213,6 +213,33 @@ uv run --isolated --python 3.10 --with-editable . \
   --with pytest --with responses pytest
 ```
 
+## Releasing
+
+Releases are automated with [tagpr](https://github.com/Songmu/tagpr) and PyPI
+[trusted publishing](https://docs.pypi.org/trusted-publishers/):
+
+1. Every push to `main` creates or updates a release pull request that bumps the version in
+   `pyproject.toml` / `uv.lock` and adds a `CHANGELOG.md` entry generated from the merged pull
+   requests. Label it `tagpr:minor` or `tagpr:major` for a bigger bump than a patch release.
+2. Merging the release pull request tags the commit and creates the GitHub release.
+3. The same workflow then tests and builds that tag, publishes it to PyPI from the `pypi`
+   environment, and attaches the distributions to the GitHub release.
+
+If publishing fails after the tag was created, run the `tagpr` workflow manually with the tag
+to publish it again.
+
+The release flow depends on settings that live outside the repository. Recreate them if the
+repository or the PyPI project changes hands:
+
+- GitHub: Settings → Actions → General → "Allow GitHub Actions to create and approve pull
+  requests" is enabled.
+- GitHub: an environment named `pypi` whose deployment branches are limited to `main`.
+- PyPI: a trusted publisher for owner `kenchan`, repository `certbot-dns-muumuu`, workflow
+  `tagpr.yml` and environment `pypi`.
+
+Release notes are generated from merged pull requests, so land changes through pull requests
+rather than direct pushes to `main`.
+
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE).
