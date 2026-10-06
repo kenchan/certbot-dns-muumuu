@@ -34,7 +34,6 @@ class Authenticator(dns_common.DNSAuthenticator):
     description = (
         "Obtain certificates using a DNS TXT record (if you are using Muumuu DNS for DNS)."
     )
-    ttl = 3600
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
