@@ -77,6 +77,16 @@ class AuthenticatorTest(test_util.TempDirTestCase, dns_test_common.BaseAuthentic
         self.mock_client.add_txt_record.assert_called_once()
 
     @test_util.patch_display_util()
+    def test_perform_continues_when_nameserver_check_fails(
+        self, unused_mock_get_utility: Any
+    ) -> None:
+        self.mock_client.get_nameserver_settings.side_effect = errors.PluginError("HTTP 503")
+
+        self.auth.perform([self.achall])
+
+        self.mock_client.add_txt_record.assert_called_once()
+
+    @test_util.patch_display_util()
     def test_perform_propagates_errors(self, unused_mock_get_utility: Any) -> None:
         self.mock_client.find_domain.side_effect = errors.PluginError("not found")
 

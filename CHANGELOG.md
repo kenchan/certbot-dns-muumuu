@@ -6,8 +6,6 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.1.0]
-
 ### Added
 
 - `dns-muumuu` authenticator that solves `dns-01` challenges with the Muumuu Domain API v2.

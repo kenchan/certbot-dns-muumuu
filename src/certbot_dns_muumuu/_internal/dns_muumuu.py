@@ -137,7 +137,11 @@ class Authenticator(dns_common.DNSAuthenticator):
     def _warn_unless_muumuu_dns(client: "_MuumuuClient", domain_id: str, zone: str) -> None:
         # Why not fail here: the API accepts record changes regardless of the nameserver
         # setting, and nameservers such as "custom" ones may still point to Muumuu DNS.
-        settings = client.get_nameserver_settings(domain_id)
+        try:
+            settings = client.get_nameserver_settings(domain_id)
+        except errors.PluginError as e:
+            logger.debug("Could not check the nameservers of %s: %s", zone, e)
+            return
         if settings.get("setup-type") != MUUMUU_DNS_SETUP_TYPE:
             logger.warning(
                 "The nameservers of %s are not set to Muumuu DNS (setup-type: %s, "

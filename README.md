@@ -185,6 +185,8 @@ on a real domain with the production API and querying `dns01.muumuu-domain.com` 
 - **At most 200 records per domain** (excluding SOA). Creating a record beyond that fails with
   "Record limit exceeded".
 - **Rate limit:** 1,000 authenticated requests per hour.
+- **Internationalized domain names are untested.** Certbot passes them in Punycode
+  (`xn--...`); whether the API matches that form has not been verified.
 
 ## Development
 
